@@ -161,8 +161,9 @@ type ClientTestSession struct {
 	disconnectedEventOccured bool
 }
 
-func (s *ClientTestSession) Connected(session Session) {
+func (s *ClientTestSession) Connected(session Session) error {
 	s.connectionEventOccured = true
+	return nil
 }
 
 func (s *ClientTestSession) Disconnected(session Session) {
@@ -225,8 +226,9 @@ type lis1a1Handler struct {
 	lasterror                   error
 }
 
-func (s *lis1a1Handler) Connected(session Session) {
+func (s *lis1a1Handler) Connected(session Session) error {
 	s.lastConnectedIp, s.lasterror = session.RemoteAddress()
+	return nil
 }
 
 func (s *lis1a1Handler) Disconnected(session Session) {

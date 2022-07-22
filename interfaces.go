@@ -36,8 +36,9 @@ type Handler interface {
 	//DataReceived event is triggered whenever the underlying protocol delivered a complete block(file/transmission) of data
 	DataReceived(session Session, data []byte, receiveTimestamp time.Time)
 	// Connected event is triggered when connection is established. For client as well as for servers. 	For clients in addition every time the connection had
-	// to be reestablished
-	Connected(session Session)
+	// to be reestablished. If this method returns anything other but null, the connections
+	// is declined and the thread ends
+	Connected(session Session) error
 	// Disconnected event is triggered when connection
 	// is terminated.
 	//For Servers: when the client ends the session

@@ -2,11 +2,12 @@ package bloodlabnet
 
 import (
 	"fmt"
-	"github.com/DRK-Blutspende-BaWueHe/go-bloodlab-net/protocol/utilities"
 	"log"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/DRK-Blutspende-BaWueHe/go-bloodlab-net/protocol/utilities"
 
 	"net"
 
@@ -21,9 +22,10 @@ type testRawDataProtocolSession struct {
 	didReceiveDisconnectMessage bool
 }
 
-func (s *testRawDataProtocolSession) Connected(session Session) {
+func (s *testRawDataProtocolSession) Connected(session Session) error {
 	s.lastConnected, _ = session.RemoteAddress()
 	s.signalReady <- true
+	return nil
 }
 
 func (s *testRawDataProtocolSession) Disconnected(session Session) {
@@ -141,13 +143,14 @@ func TestRawDataProtocolSendingStress(t *testing.T) {
 }
 */
 //------------------------------------------------------
-// Test that the server declines too many connections
+// Server declines too many connections ...
 //------------------------------------------------------
 type testTCPServerMaxConnections struct {
 	maxConnectionErrorDidOccur bool
 }
 
-func (s *testTCPServerMaxConnections) Connected(session Session) {
+func (s *testTCPServerMaxConnections) Connected(session Session) error {
+	return nil
 }
 
 func (s *testTCPServerMaxConnections) Disconnected(session Session) {
@@ -225,7 +228,8 @@ type testSTXETXProtocolSession struct {
 	didReceiveDisconnectMessage bool
 }
 
-func (s *testSTXETXProtocolSession) Connected(session Session) {
+func (s *testSTXETXProtocolSession) Connected(session Session) error {
+	return nil
 }
 
 func (s *testSTXETXProtocolSession) Disconnected(session Session) {
@@ -310,8 +314,9 @@ type genericRecordingHandler struct {
 	lasterror                   error
 }
 
-func (s *genericRecordingHandler) Connected(session Session) {
+func (s *genericRecordingHandler) Connected(session Session) error {
 	s.lastConnectedIp, s.lasterror = session.RemoteAddress()
+	return nil
 }
 
 func (s *genericRecordingHandler) Disconnected(session Session) {
@@ -536,6 +541,44 @@ func TestLis1A1Protocol(t *testing.T) {
 			}
 		}
 	}
+
+	tcpServer.Stop()
+}
+
+//------------------------------------------------------
+// Connection declined by Handler
+//------------------------------------------------------
+type testTCPServerDeclineConnection struct {
+	maxConnectionErrorDidOccur bool
+}
+
+func (s *testTCPServerDeclineConnection) Connected(session Session) error {
+	return fmt.Errorf("Invalid connection")
+}
+
+func (s *testTCPServerDeclineConnection) Disconnected(session Session) {}
+func (s *testTCPServerDeclineConnection) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) {
+}
+func (s *testTCPServerDeclineConnection) Error(session Session, errorType ErrorType, err error) {}
+
+func TestTCPServerDeclineConnection(t *testing.T) {
+
+	tcpServer := CreateNewTCPServerInstance(40015,
+		protocol.Raw(protocol.DefaultRawProtocolSettings()),
+		NoLoadBalancer,
+		2,
+		DefaultTCPServerSettings)
+
+	var handlerTcp testTCPServerDeclineConnection
+	handlerTcp.maxConnectionErrorDidOccur = false
+
+	go tcpServer.Run(&handlerTcp)
+
+	conn1, err1 := net.Dial("tcp", "127.0.0.1:4015")
+	assert.NotNil(t, err1) // the server instantly declines this connection
+	assert.Nil(t, conn1)
+
+	time.Sleep(time.Second * 1) // sessions start async, therefor a short waitign is required
 
 	tcpServer.Stop()
 }

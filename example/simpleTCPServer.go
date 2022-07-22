@@ -11,8 +11,9 @@ import (
 type MySessionHandler struct {
 }
 
-func (s *MySessionHandler) Connected(session bnet.Session) {
+func (s *MySessionHandler) Connected(session bnet.Session) error {
 	fmt.Println("Connect Event")
+	return nil
 }
 
 func (s *MySessionHandler) Disconnected(session bnet.Session) {
