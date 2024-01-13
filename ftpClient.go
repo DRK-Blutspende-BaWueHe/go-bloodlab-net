@@ -172,6 +172,10 @@ func DefaultFTPConfig() *ftpConfiguration {
 	return ftpc
 }
 
+func (conf *ftpServerInstance) WaitReady() bool {
+	return false
+}
+
 func (instance *ftpServerInstance) Run(handler Handler) {
 	switch instance.ftpType {
 	case FTP:

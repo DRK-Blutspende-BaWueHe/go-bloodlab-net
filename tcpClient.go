@@ -50,6 +50,11 @@ func CreateNewTCPClient(hostname string, port int,
 	}
 }
 
+func (s *tcpClientConnectionAndSession) WaitReady() bool {
+	// a client is not async. this function is only useful for the server
+	return false
+}
+
 // Run - Ensure the client stays connected and receives Data.
 // On disconnect from server the client will forever retry to connect.
 // Call Stop() will exit the loop

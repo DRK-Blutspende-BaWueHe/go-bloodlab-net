@@ -15,6 +15,8 @@ type ConnectionInstance interface {
 	Stop()
 	// Retrieve a session by IP. Do not use this for a normal protocol conversion of a server... Can return nil
 	FindSessionsByIp(ip string) []Session
+	// Wait until the server is ready for connections. Useful at startup. Returns true when the server is ready
+	WaitReady() bool
 }
 
 type Session interface {

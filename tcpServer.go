@@ -17,23 +17,24 @@ import (
 )
 
 type tcpServerInstance struct {
-	listeningPort    int
-	LowLevelProtocol protocol.Implementation
-	connectionType   ConnectionType
-	maxConnections   int
-	timingConfig     TCPServerConfiguration
-	isRunning        bool
-	sessionCount     int
-	listener         net.Listener
-	handler          Handler
-	mainLoopActive   *sync.WaitGroup
-	sessions         []*tcpServerSession
+	listeningPort      int
+	LowLevelProtocol   protocol.Implementation
+	connectionType     ConnectionType
+	maxConnections     int
+	timingConfig       TCPServerConfiguration
+	isRunning          bool
+	sessionCount       int
+	listener           net.Listener
+	handler            Handler
+	mainLoopActive     *sync.WaitGroup
+	sessions           []*tcpServerSession
+	waitRunningChannel chan bool
 }
 
-//--------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------
 // BufferedConn wrapping the net.Conn yet compatible for better reading performance and a
 // peek preview.
-//--------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------
 type BufferedConn struct {
 	r        *bufio.Reader
 	net.Conn // So that most methods are embedded
@@ -80,17 +81,23 @@ func CreateNewTCPServerInstance(listeningPort int, protocolReceiveve protocol.Im
 	}
 
 	return &tcpServerInstance{
-		listeningPort:    listeningPort,
-		LowLevelProtocol: protocolReceiveve,
-		maxConnections:   maxConnections,
-		connectionType:   connectionType,
-		timingConfig:     thetimingConfig,
-		sessionCount:     0,
-		handler:          nil,
-		mainLoopActive:   &sync.WaitGroup{},
-		sessions:         make([]*tcpServerSession, 0),
+		listeningPort:      listeningPort,
+		LowLevelProtocol:   protocolReceiveve,
+		maxConnections:     maxConnections,
+		connectionType:     connectionType,
+		timingConfig:       thetimingConfig,
+		sessionCount:       0,
+		handler:            nil,
+		mainLoopActive:     &sync.WaitGroup{},
+		sessions:           make([]*tcpServerSession, 0),
+		waitRunningChannel: make(chan bool),
 	}
 
+}
+
+func (instance *tcpServerInstance) WaitReady() bool {
+	instance.waitRunningChannel <- true
+	return true
 }
 
 func (instance *tcpServerInstance) Stop() {
@@ -124,6 +131,13 @@ func (instance *tcpServerInstance) Run(handler Handler) {
 	instance.mainLoopActive.Add(1)
 
 	for instance.isRunning {
+
+		// if any thread waits for notification that the loop is running, this is it
+		select {
+		case <-instance.waitRunningChannel:
+			// by reading from the channel, this unblocks the writers
+		default:
+		}
 
 		connection, err := proxyListener.Accept()
 		if err != nil {

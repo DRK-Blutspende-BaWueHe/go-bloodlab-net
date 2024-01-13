@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,25 +16,32 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type testRawDataProtocolSession struct {
-	receiveQ                    chan []byte
-	lastConnected               string
-	signalReady                 chan bool
-	didReceiveDisconnectMessage bool
+type testSessionMock struct {
+	errorThatWillbeReturnedOnConnect error
+	receiveQ                         chan []byte
+	lastConnectedIp                  string
+	signalReady                      chan bool
+	didReceiveDisconnectMessage      bool
+	occuredErrorTypes                []ErrorType
 }
 
-func (s *testRawDataProtocolSession) Connected(session Session) error {
-	s.lastConnected, _ = session.RemoteAddress()
+func (s *testSessionMock) Connected(session Session) error {
+
+	if s.errorThatWillbeReturnedOnConnect != nil { // This is for the "error on connect test"
+		return s.errorThatWillbeReturnedOnConnect
+	}
+
+	s.lastConnectedIp, _ = session.RemoteAddress()
 	s.signalReady <- true
 	return nil
 }
 
-func (s *testRawDataProtocolSession) Disconnected(session Session) {
+func (s *testSessionMock) Disconnected(session Session) {
 	s.didReceiveDisconnectMessage = true
 }
 
-func (s *testRawDataProtocolSession) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
-	s.lastConnected, _ = session.RemoteAddress()
+func (s *testSessionMock) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
+	s.lastConnectedIp, _ = session.RemoteAddress()
 	s.receiveQ <- fileData
 
 	anResponse := make([][]byte, 0)
@@ -43,25 +51,36 @@ func (s *testRawDataProtocolSession) DataReceived(session Session, fileData []by
 	return nil
 }
 
-func (s *testRawDataProtocolSession) Error(session Session, errorType ErrorType, err error) {
-	log.Fatal("Fatal error:", err)
+func (s *testSessionMock) Error(session Session, errorType ErrorType, err error) {
+	s.occuredErrorTypes = append(s.occuredErrorTypes, errorType)
 }
 
+// --------------------------------------------------------------------------------------------
+// The server is expected to buffer received data. When a timeout occurs and the connection is
+// closed, that buffer needs to be flushed to its handler. With the Raw Protocol the change
+// should be read instantly.
+// --------------------------------------------------------------------------------------------
 func TestRawDataProtocolWithTimeoutFlushMs(t *testing.T) {
 	tcpServer := CreateNewTCPServerInstance(4001,
 		protocol.Raw(protocol.DefaultRawProtocolSettings()), NoLoadBalancer, 100, DefaultTCPServerSettings)
 
-	var handler testRawDataProtocolSession
+	var handler testSessionMock
 	handler.receiveQ = make(chan []byte, 500)
 	handler.signalReady = make(chan bool)
 
 	isServerHalted := false
 
 	// run the mainloop, observe that it closes later
+	waitRunning := sync.Mutex{}
+	waitRunning.Lock()
 	go func() {
+		waitRunning.Unlock()
 		tcpServer.Run(&handler)
 		isServerHalted = true
 	}()
+	waitRunning.Lock()
+	// allow time for the server to startup. This could be better handled with a status (TODO)
+	time.Sleep(1 * time.Second)
 
 	// connect and expect connection handler to signal
 	clientConn, err := net.Dial("tcp", "127.0.0.1:4001")
@@ -73,7 +92,7 @@ func TestRawDataProtocolWithTimeoutFlushMs(t *testing.T) {
 	select {
 	case isReady := <-handler.signalReady:
 		if isReady {
-			assert.Equal(t, "127.0.0.1", handler.lastConnected)
+			assert.Equal(t, "127.0.0.1", handler.lastConnectedIp)
 		}
 	case <-time.After(2 * time.Second):
 		{
@@ -81,12 +100,12 @@ func TestRawDataProtocolWithTimeoutFlushMs(t *testing.T) {
 		}
 	}
 
-	// send data to server, expect it to receive
+	// send data to server, expect it to receive it
 	const TESTSTRING = "Hello its me"
 	_, err = clientConn.Write([]byte(TESTSTRING))
 	assert.Nil(t, err)
 
-	select {
+	select { // expecting to receive the same string
 	case receivedMsg := <-handler.receiveQ:
 		assert.NotNil(t, receivedMsg, "Received a valid response")
 		assert.Equal(t, TESTSTRING, string(receivedMsg))
@@ -110,64 +129,61 @@ func TestRawDataProtocolWithTimeoutFlushMs(t *testing.T) {
 
 	tcpServer.Stop()
 	assert.True(t, isServerHalted, "Server has been stopped")
-
 }
 
-// Create some stress by pushing a lot of transmissions
-/*
-func TestRawDataProtocolSendingStress(t *testing.T) {
+// --------------------------------------------------------------------------------------------
+// When writing large amounts of data into one connection, that data should be processed
+// sequentially. Using the STX-ETX here to indicate start and end of the messaage
+// --------------------------------------------------------------------------------------------
+func TestSendingLargeAmount(t *testing.T) {
+
 	tcpServer := CreateNewTCPServerInstance(4003,
-		protocol.Raw(protocol.DefaultRawProtocolSettings()), NoLoadBalancer, 100, DefaultTCPServerSettings)
-	var handler testRawDataProtocolSession
-	handler.receiveQ = make(chan []byte, 500)
-	go tcpServer.Run(&handler)
+		protocol.STXETX(protocol.DefaultSTXETXProtocolSettings()), NoLoadBalancer, 100, DefaultTCPServerSettings)
+
+	handler := &testSessionMock{
+		receiveQ:    make(chan []byte, 500),
+		signalReady: make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+	}
+	go tcpServer.Run(handler)
+	tcpServer.WaitReady()
 
 	clientConn, err := net.Dial("tcp", "127.0.0.1:4003")
 	if err != nil {
 		log.Fatalf("Failed to dial (this is not an error, rather a problem of the unit test itself) : %s", err)
 	}
 
+	dataIsSendSignal := make(chan bool)
 	go func() {
+		clientConn.Write([]byte{utilities.STX})
 		for i := 0; i < 20000; i++ {
 			clientConn.Write([]byte("A lot of data is pushed into the server, lets see how it deals with it"))
 		}
+		clientConn.Write([]byte{utilities.ETX})
+		dataIsSendSignal <- true // dignal that writing is done
 	}()
-	time.Sleep(time.Second * 1)
-	clientConn.Close()
 
-	time.Sleep(time.Second * 1)
+	// wait for the signal that data is sent
+	select {
+	case <-dataIsSendSignal: //
+	case <-time.After(3 * time.Second):
+		t.Fail() // timeout
+	}
+
 	expectString := ""
 	for j := 0; j < 20000; j++ {
 		expectString = expectString + "A lot of data is pushed into the server, lets see how it deals with it"
 	}
 	in := <-handler.receiveQ
+
+	// expecting EXACTLY the data out that we put in
 	assert.Equal(t, expectString, string(in))
-}
-*/
-//------------------------------------------------------
-// Server declines too many connections ...
-//------------------------------------------------------
-type testTCPServerMaxConnections struct {
-	maxConnectionErrorDidOccur bool
+
+	clientConn.Close()
 }
 
-func (s *testTCPServerMaxConnections) Connected(session Session) error {
-	return nil
-}
-
-func (s *testTCPServerMaxConnections) Disconnected(session Session) {
-}
-
-func (s *testTCPServerMaxConnections) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
-	return nil
-}
-
-func (s *testTCPServerMaxConnections) Error(session Session, errorType ErrorType, err error) {
-	if errorType == ErrorMaxConnections {
-		s.maxConnectionErrorDidOccur = true
-	}
-}
-
+// --------------------------------------------------------------------------------------------
+// When reaching the connection limit, the server should decline further connections
+// --------------------------------------------------------------------------------------------
 func TestTCPServerMaxConnections(t *testing.T) {
 
 	tcpServer := CreateNewTCPServerInstance(4002,
@@ -176,10 +192,14 @@ func TestTCPServerMaxConnections(t *testing.T) {
 		2,
 		DefaultTCPServerSettings)
 
-	var handlerTcp testTCPServerMaxConnections
-	handlerTcp.maxConnectionErrorDidOccur = false
+	handlerTcp := &testSessionMock{
+		receiveQ:          make(chan []byte, 500),
+		signalReady:       make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		occuredErrorTypes: make([]ErrorType, 0),
+	}
 
-	go tcpServer.Run(&handlerTcp)
+	go tcpServer.Run(handlerTcp)
+	tcpServer.WaitReady()
 
 	conn1, err1 := net.Dial("tcp", "127.0.0.1:4002")
 	assert.Nil(t, err1)
@@ -193,16 +213,17 @@ func TestTCPServerMaxConnections(t *testing.T) {
 	assert.Nil(t, err3)
 	assert.NotNil(t, conn3)
 
-	time.Sleep(time.Second * 1) // sessions start async, therefor a short waitign is required
+	// sessions for the clients start asynchronous, we need to wait for the process to start in order to count the clients
+	time.Sleep(time.Second * 1)
 
-	assert.True(t, handlerTcp.maxConnectionErrorDidOccur, "Expected error: MaxConnections did occur")
+	assert.Equal(t, ErrorMaxConnections, handlerTcp.occuredErrorTypes[0])
 
 	tcpServer.Stop()
 }
 
-// ------------------------------------------------------
-// Server identifies the remote-Address
-// ------------------------------------------------------
+// --------------------------------------------------------------------------------------------
+// Server identifies the remote-Address on direct connections
+// --------------------------------------------------------------------------------------------
 func TestTCPServerIdentifyRemoteAddress(t *testing.T) {
 	tcpServer := CreateNewTCPServerInstance(4005,
 		protocol.Raw(protocol.DefaultRawProtocolSettings()),
@@ -210,138 +231,31 @@ func TestTCPServerIdentifyRemoteAddress(t *testing.T) {
 		2,
 		DefaultTCPServerSettings)
 
-	var handlerTcp genericRecordingHandler
+	handlerTcp := &testSessionMock{
+		receiveQ:    make(chan []byte, 500),
+		signalReady: make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		//		occuredErrorTypes: make([]ErrorType, 0),
+	}
 
-	go tcpServer.Run(&handlerTcp)
+	go tcpServer.Run(handlerTcp)
+	tcpServer.WaitReady()
 
 	conn1, err1 := net.Dial("tcp", "127.0.0.1:4005")
 	assert.Nil(t, err1)
 	assert.NotNil(t, conn1)
 
+	// sessions for the clients start asynchronous, we need to wait for the process to start in order to count the clients
 	time.Sleep(time.Second * 1) // sessions start async, therefor a short waitign is required
 
 	assert.Equal(t, "127.0.0.1", handlerTcp.lastConnectedIp)
 }
 
-// --------------------------------------------------------------
-// Test STX Protocol
-// --------------------------------------------------------------
-type testSTXETXProtocolSession struct {
-	receiveQ                    chan []byte
-	didReceiveDisconnectMessage bool
-}
-
-func (s *testSTXETXProtocolSession) Connected(session Session) error {
-	return nil
-}
-
-func (s *testSTXETXProtocolSession) Disconnected(session Session) {
-	s.didReceiveDisconnectMessage = true
-}
-
-func (s *testSTXETXProtocolSession) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
-	s.receiveQ <- fileData
-
-	// build a response that exceeds the MTU to ensure stx-etx reads start and stop codes
-	largeDataPackage := ""
-	for i := 0; i < 80000; i++ {
-		largeDataPackage = largeDataPackage + "X"
-	}
-
-	largeData := make([][]byte, 0)
-	largeData = append(largeData, []byte(largeDataPackage))
-	session.Send(largeData)
-
-	return nil
-}
-
-func (s *testSTXETXProtocolSession) Error(session Session, errorType ErrorType, err error) {
-	log.Fatal("Fatal error:", err)
-}
-
-func TestSTXETXProtocol(t *testing.T) {
-
-	const TESTSTRING = "Submitting data test"
-
-	tcpServer := CreateNewTCPServerInstance(4009,
-		protocol.STXETX(protocol.DefaultSTXETXProtocolSettings()),
-		NoLoadBalancer,
-		100,
-		DefaultTCPServerSettings)
-
-	var handler testSTXETXProtocolSession
-	handler.receiveQ = make(chan []byte, 500)
-
-	go tcpServer.Run(&handler)
-
-	clientConn, err := net.Dial("tcp", "127.0.0.1:4009")
-	if err != nil {
-		log.Fatalf("Failed to dial (this is not an error, rather a problem of the unit test itself) : %s", err)
-	}
-
-	_, err = clientConn.Write([]byte("\u0002" + TESTSTRING + "\u0003"))
-	assert.Nil(t, err)
-
-	select {
-	case receivedMsg := <-handler.receiveQ:
-		assert.NotNil(t, receivedMsg, "Received a valid response")
-		assert.Equal(t, TESTSTRING, string(receivedMsg))
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Timout waiting on valid response. This means the Server was unable to receive this message ")
-	}
-
-	// At this point the server should respond to the received data with a few XXXes
-	_ = clientConn.SetDeadline(time.Now().Add(time.Second * 2))
-	buffer := make([]byte, 90000)
-	n, err := clientConn.Read(buffer)
-
-	assert.Nil(t, err, "Reading from client.")
-
-	largeDataPackage := ""
-	for i := 0; i < 80000; i++ {
-		largeDataPackage = largeDataPackage + "X"
-	}
-
-	assert.Equal(t, "\u0002"+largeDataPackage+"\r\u0003", string(buffer[:n]))
-
-	tcpServer.Stop()
-}
-
-// ----------------------------------------------------------------------------------------
-// Test STX Protocol with Packages larger than the buffer and 2 messages in the stream
-// STX first string ETX data to be ignored STX second string ETX
-// expecting this to create two data-received events
-// ----------------------------------------------------------------------------------------
-type genericRecordingHandler struct {
-	receiveQ                    chan []byte
-	didReceiveDisconnectMessage bool
-	lastConnectedIp             string
-	lasterror                   error
-}
-
-func (s *genericRecordingHandler) Connected(session Session) error {
-	s.lastConnectedIp, s.lasterror = session.RemoteAddress()
-	return nil
-}
-
-func (s *genericRecordingHandler) Disconnected(session Session) {
-	s.didReceiveDisconnectMessage = true
-}
-
-func (s *genericRecordingHandler) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
-	fmt.Println("Eventhandler : ", string(fileData))
-	s.receiveQ <- fileData
-	return nil
-}
-
-func (s *genericRecordingHandler) Error(session Session, errorType ErrorType, err error) {
-	if err != nil {
-		s.receiveQ <- []byte(err.Error())
-		log.Fatalf("Error: %s", err.Error())
-	}
-}
-
-func TestSTXETXBufferOverflowProtocol(t *testing.T) {
+// --------------------------------------------------------------------------------------------
+// Sending "out of frame" extra data, classical used for buffer-overflows, because protocols
+// often turn a blind eye to unexpected data. The expected behaviour here is that that data
+// plainly gets ignored
+// --------------------------------------------------------------------------------------------
+func TestSTXETXOutOfFrameData(t *testing.T) {
 
 	const TESTSTRING = "Submitting data test"
 	const TESTSTRING2 = "This is the second datapackage within the same datastream"
@@ -352,15 +266,17 @@ func TestSTXETXBufferOverflowProtocol(t *testing.T) {
 		100,
 		DefaultTCPServerSettings)
 
-	var handler genericRecordingHandler
-	handler.receiveQ = make(chan []byte, 500)
+	handler := &testSessionMock{
+		receiveQ:          make(chan []byte, 500),
+		signalReady:       make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		occuredErrorTypes: make([]ErrorType, 0),
+	}
 
-	go tcpServer.Run(&handler)
+	go tcpServer.Run(handler)
+	tcpServer.WaitReady()
 
 	clientConn, err := net.Dial("tcp", "127.0.0.1:4010")
-	if err != nil {
-		log.Fatalf("Failed to dial (this is not an error, rather a problem of the unit test itself) : %s", err)
-	}
+	assert.Nil(t, err)
 
 	_, err = clientConn.Write([]byte("\u0002" + TESTSTRING + "\u0003IngoredData}\u0002" + TESTSTRING2 + "\u0003"))
 	assert.Nil(t, err)
@@ -384,18 +300,25 @@ func TestSTXETXBufferOverflowProtocol(t *testing.T) {
 	tcpServer.Stop()
 }
 
-// TestDropConnectionsAfterError
-// Limit connectios to 2, use them, close them -> expect them to be free-ed after close
+// --------------------------------------------------------------------------------------------
+// When connections are dropped, their memory needs to be freed and the slot needs to be
+// made available again. This test opens 2 connections, closes both, then opens a third
+// one and verifies that the communication still works as expected by sending data.
+// --------------------------------------------------------------------------------------------
 func TestDropConnectionsAfterError(t *testing.T) {
 	tcpServer := CreateNewTCPServerInstance(4013,
 		protocol.STXETX(),
 		NoLoadBalancer,
 		2 /* MAX Connection */)
 
-	var handler genericRecordingHandler
-	handler.receiveQ = make(chan []byte, 10)
+	handler := &testSessionMock{
+		receiveQ:          make(chan []byte, 500),
+		signalReady:       make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		occuredErrorTypes: make([]ErrorType, 0),
+	}
 
-	go tcpServer.Run(&handler)
+	go tcpServer.Run(handler)
+	tcpServer.WaitReady()
 
 	conn, err := net.Dial("tcp", "127.0.0.1:4013")
 	assert.Nil(t, err)
@@ -425,15 +348,10 @@ func TestDropConnectionsAfterError(t *testing.T) {
 	tcpServer.Stop()
 }
 
-//----------------------------------------------------------------------------------------
-// LIS1A1 Protocol
-//----------------------------------------------------------------------------------------
-
-type Comm struct {
-	Receive bool
-	Data    []byte
-}
-
+// ----------------------------------------------------------------------------------------
+// Run a full protocol of an everyday laboratoy instrument. This is a typical use case
+// for bnet
+// ----------------------------------------------------------------------------------------
 func TestLis1A1Protocol(t *testing.T) {
 
 	tcpServer := CreateNewTCPServerInstance(4011,
@@ -442,19 +360,22 @@ func TestLis1A1Protocol(t *testing.T) {
 		100,
 		DefaultTCPServerSettings)
 
-	fmt.Println("Server running ? ")
-
-	var handler genericRecordingHandler
-	handler.receiveQ = make(chan []byte, 500)
-	go tcpServer.Run(&handler)
-
-	fmt.Println("Run client")
-	clientConn, err := net.Dial("tcp", "127.0.0.1:4011")
-	if err != nil {
-		log.Fatalf("Failed to dial (this is not an error, rather a problem of the unit test itself) : %s", err)
+	handler := &testSessionMock{
+		receiveQ:          make(chan []byte, 500),
+		signalReady:       make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		occuredErrorTypes: make([]ErrorType, 0),
 	}
+	go tcpServer.Run(handler)
+	tcpServer.WaitReady()
 
-	communicationFlow := []Comm{
+	clientConn, err := net.Dial("tcp", "127.0.0.1:4011")
+	assert.Nil(t, err)
+
+	// An inline Script for the expected communication-flow
+	communicationFlow := []struct {
+		Receive bool
+		Data    []byte
+	}{
 		{Data: []byte{utilities.ENQ}, Receive: false},
 		{Data: []byte{utilities.ACK}, Receive: true},
 		{Data: []byte{utilities.STX}, Receive: false},
@@ -522,8 +443,6 @@ func TestLis1A1Protocol(t *testing.T) {
 		{Data: []byte{utilities.EOT}, Receive: false},
 	}
 
-	fmt.Println("Start running")
-
 	for _, rec := range communicationFlow {
 		if !rec.Receive {
 
@@ -551,23 +470,10 @@ func TestLis1A1Protocol(t *testing.T) {
 	tcpServer.Stop()
 }
 
-// ------------------------------------------------------
-// Connection declined by Handler
-// ------------------------------------------------------
-type testTCPServerDeclineConnection struct {
-	maxConnectionErrorDidOccur bool
-}
-
-func (s *testTCPServerDeclineConnection) Connected(session Session) error {
-	return fmt.Errorf("Invalid connection")
-}
-
-func (s *testTCPServerDeclineConnection) Disconnected(session Session) {}
-func (s *testTCPServerDeclineConnection) DataReceived(session Session, fileData []byte, receiveTimestamp time.Time) error {
-	return nil
-}
-func (s *testTCPServerDeclineConnection) Error(session Session, errorType ErrorType, err error) {}
-
+// ----------------------------------------------------------------------------------------
+// When a connection is made and the Session does return an error, the Server is
+// expected to instantly close and drop that connection.
+// ----------------------------------------------------------------------------------------
 func TestTCPServerDeclineConnection(t *testing.T) {
 
 	tcpServer := CreateNewTCPServerInstance(40015,
@@ -576,16 +482,19 @@ func TestTCPServerDeclineConnection(t *testing.T) {
 		2,
 		DefaultTCPServerSettings)
 
-	var handlerTcp testTCPServerDeclineConnection
-	handlerTcp.maxConnectionErrorDidOccur = false
+	handler := &testSessionMock{
+		errorThatWillbeReturnedOnConnect: fmt.Errorf("Invalid connection"),
+		//		receiveQ:                         make(chan []byte, 500),
+		//		signalReady:                      make(chan bool, 100), // buffered so that we can ignore this signal without blocking process
+		//		occuredErrorTypes:                make([]ErrorType, 0),
+	}
 
-	go tcpServer.Run(&handlerTcp)
+	go tcpServer.Run(handler)
+	tcpServer.WaitReady()
 
 	conn1, err1 := net.Dial("tcp", "127.0.0.1:4015")
 	assert.NotNil(t, err1) // the server instantly declines this connection
 	assert.Nil(t, conn1)
-
-	time.Sleep(time.Second * 1) // sessions start async, therefor a short waitign is required
 
 	tcpServer.Stop()
 }
