@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,17 +13,18 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-/* Run a Server for one connection, reading from socket, writing to channel
-reading from channel, writing to socket Server stops when client disconnects
-*/
-
+// --------------------------------------------------------------------------------------------
+// Run a Server for one connection, reading from socket, writing to channel
+// reading from channel, writing to socket Server stops when client disconnects
+// --------------------------------------------------------------------------------------------
 func runTCPMockServer(port int, tcpMockServerSendQ chan []byte, tcpMockServerReceiveQ chan []byte) {
-	var listener net.Listener
 
-	if listener != nil { // In case previous session got stuck remove it
-		listener.Close()
-	}
+	waitStartup := sync.Mutex{}
+	waitStartup.Lock()
+
 	go func() {
+
+		waitStartup.Unlock() // release the main-thread
 
 		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
@@ -36,7 +38,7 @@ func runTCPMockServer(port int, tcpMockServerSendQ chan []byte, tcpMockServerRec
 		}
 		buf := make([]byte, 100)
 		for {
-			conn.SetDeadline(time.Now().Add(time.Millisecond * 200))
+			conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 			n, err := conn.Read(buf)
 			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() { // timeout dont care
 			} else if err == io.EOF {
@@ -62,13 +64,17 @@ func runTCPMockServer(port int, tcpMockServerSendQ chan []byte, tcpMockServerRec
 		}
 
 	}()
+
+	// a very short delay is necessary to wait for the port to be opened
+	time.Sleep(100 * time.Millisecond)
+
+	// This will block until the thread is running
+	waitStartup.Lock()
 }
 
-/*
-Connect to TCP-Server, Read Data and transmit data
-
-For parallel test-execution keep server-port unique throughout the suite
-*/
+// --------------------------------------------------------------------------------------------
+// Connect to TCP-Server, Send and receive Raw Data
+// --------------------------------------------------------------------------------------------
 func TestClientConnectReceiveAndSendRaw(t *testing.T) {
 
 	var tcpMockServerSendQ chan []byte = make(chan []byte, 1)
@@ -87,6 +93,7 @@ func TestClientConnectReceiveAndSendRaw(t *testing.T) {
 	testStringBytes := make([][]byte, 0)
 	testStringBytes = append(testStringBytes, []byte(TESTSTRINGSEND))
 	n, err := tcpClient.Send(testStringBytes)
+	assert.Nil(t, err)
 	if err != nil {
 		panic(err)
 	}
@@ -103,11 +110,11 @@ func TestClientConnectReceiveAndSendRaw(t *testing.T) {
 	tcpClient.Stop()
 }
 
-/*
-***************************************************************
-Protocol wrapped STX Send and Receive
-***************************************************************
-*/
+// --------------------------------------------------------------------------------------------
+// The server sends us some data and we are expected to receive it
+// This test does not evaluate the STXETX, instead it uses it to show that
+// the encoder/decoder docks well into the client implementation
+// --------------------------------------------------------------------------------------------
 func TestClientProtocolSTXETX(t *testing.T) {
 	var tcpMockServerSendQ chan []byte = make(chan []byte, 1)
 	var tcpMockServerReceiveQ chan []byte = make(chan []byte, 1)
@@ -117,7 +124,6 @@ func TestClientProtocolSTXETX(t *testing.T) {
 		protocol.STXETX(protocol.DefaultSTXETXProtocolSettings()),
 		NoLoadBalancer, DefaultTCPClientSettings)
 
-	// Receiving from instrument expecting STX and ETX removed
 	TESTSTRING := "H|\\^&|||bloodlab-net|e2etest||||||||20220614163728\nL|1|N"
 	tcpMockServerSendQ <- []byte("\u0002" + TESTSTRING + "\u0003")
 	receivedMsg, err := tcpClient.Receive()
@@ -136,11 +142,11 @@ func TestClientProtocolSTXETX(t *testing.T) {
 	tcpClient.Stop()
 }
 
-/*
-***************************************************************
-Test client remote address
-***************************************************************
-*/
+// --------------------------------------------------------------------------------------------
+// When the client is asked to reveal the remote-address, it should return the
+// server it is connected to.
+// This feature is because in bnet client and server expose the same API to the user.
+// --------------------------------------------------------------------------------------------
 func TestClientRemoteAddress(t *testing.T) {
 	var tcpMockServerSendQ chan []byte = make(chan []byte, 1)
 	var tcpMockServerReceiveQ chan []byte = make(chan []byte, 1)
@@ -151,16 +157,17 @@ func TestClientRemoteAddress(t *testing.T) {
 		NoLoadBalancer,
 		DefaultTCPClientSettings)
 
-	tcpClient.Connect()
-	addr, _ := tcpClient.RemoteAddress()
+	err := tcpClient.Connect()
+	assert.Nil(t, err)
+
+	addr, err := tcpClient.RemoteAddress()
+	assert.Nil(t, err)
 	assert.Equal(t, "127.0.0.1", addr)
 }
 
-/*
-***************************************************************
-Test client with Run-Session to connect, handle async events
-***************************************************************
-*/
+// --------------------------------------------------------------------------------------------
+// Test if the session really is freed when the client disconnects (Stop method)
+// --------------------------------------------------------------------------------------------
 type ClientTestSession struct {
 	receiveBuffer            string
 	connectionEventOccured   bool
@@ -217,7 +224,7 @@ func TestClientRun(t *testing.T) {
 	assert.True(t, session.connectionEventOccured, "The event 'connected' was triggered")
 	assert.Equal(t, session.receiveBuffer, TESTSTRING)
 
-	// Does Stop really stop the eventloop ?
+	// Stop and then check if the client really was disconnected from the server
 	tcpClient.Stop()
 
 	time.Sleep(time.Second * 1) // TODO: Wait data beeing sent
@@ -252,6 +259,9 @@ func (s *lis1a1Handler) Error(session Session, errorType ErrorType, err error) {
 	log.Fatal("Fatal error:", err)
 }
 
+// --------------------------------------------------------------------------------------------
+// Test the use-case "submitting data as lis2 client"
+// --------------------------------------------------------------------------------------------
 func TestLis1A1ProtocolClient(t *testing.T) {
 	tcpServer := CreateNewTCPServerInstance(4004, protocol.Lis1A1Protocol(protocol.DefaultLis1A1ProtocolSettings()),
 		NoLoadBalancer,

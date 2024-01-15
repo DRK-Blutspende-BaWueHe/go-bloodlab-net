@@ -31,11 +31,12 @@ type tcpClientConnectionAndSession struct {
 func CreateNewTCPClient(hostname string, port int,
 	lowLevelProtocol protocol.Implementation,
 	proxy ConnectionType, timing ...TCPClientConfiguration) ConnectionAndSessionInstance {
-	var thetiming TCPClientConfiguration
+
+	var clientConfiguration TCPClientConfiguration
 	if len(timing) == 0 {
-		thetiming = DefaultTCPClientSettings
+		clientConfiguration = DefaultTCPClientSettings
 	} else {
-		thetiming = timing[0]
+		clientConfiguration = timing[0]
 	}
 
 	return &tcpClientConnectionAndSession{
@@ -43,7 +44,7 @@ func CreateNewTCPClient(hostname string, port int,
 		port:             port,
 		lowLevelProtocol: lowLevelProtocol,
 		proxy:            proxy,
-		timingConfig:     thetiming,
+		timingConfig:     clientConfiguration,
 		connected:        false,
 		isStopped:        false,
 		handler:          nil, // is set by run
