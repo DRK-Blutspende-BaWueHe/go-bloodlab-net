@@ -374,7 +374,7 @@ func (p *au6xxProtocol) Receive(conn net.Conn) ([]byte, error) {
 	switch message.Status {
 	case DATA:
 		return message.Data, nil
-	case EOF:
+	case EOF, DISCONNECT:
 		return []byte{}, io.EOF
 	case ERROR:
 		return []byte{}, fmt.Errorf("error while reading - abort receiving data: %s", string(message.Data))
